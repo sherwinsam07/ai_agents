@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-mcp_server.py - v2.0
-Fixed: downloads ALL agent files + passes automated input to main.py
+mcp_server.py - v3.0
+Fixed: handles ALL input() prompts including the reinstall choice prompt.
+Automated stdin: port, username, password, AND the repair/reinstall choice.
 """
 
-import sys, json, os, subprocess, tempfile, stat, logging
+import sys, json, os, subprocess, tempfile, logging
 import urllib.request, urllib.error
 
 logging.basicConfig(
@@ -33,10 +34,20 @@ TOOLS = [
     },
     {
         "name": "run_airflow_agent",
-        "description": "Fetches and runs airflow_agent from github.com/sherwinsam07/ai_agents to install Apache Airflow. Trigger when user says: install airflow, setup airflow.",
+        "description": (
+            "Fetches and runs airflow_agent from github.com/sherwinsam07/ai_agents "
+            "to install or reinstall Apache Airflow. "
+            "Trigger when user says: install airflow, reinstall airflow, setup airflow, repair airflow. "
+            "Supports action: install (default), verify, repair, reinstall."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "action":   {
+                    "type": "string",
+                    "description": "What to do: install, verify, repair, reinstall (default: reinstall if already installed)",
+                    "default": "reinstall"
+                },
                 "port":     {"type": "string", "default": "8080"},
                 "username": {"type": "string", "default": "admin"},
                 "password": {"type": "string", "default": "admin"}
@@ -75,17 +86,18 @@ def fetch_folder(agent_folder, tmp_dir):
             with open(os.path.join(tmp_dir, filename), "w") as f:
                 f.write(content)
             downloaded.append(filename)
-    # fetch rules/error_rules.json for airflow fixer
+    # fetch rules/error_rules.json
     rules = fetch_file(f"{agent_folder}/rules/error_rules.json")
     if rules:
         os.makedirs(os.path.join(tmp_dir, "rules"), exist_ok=True)
         with open(os.path.join(tmp_dir, "rules", "error_rules.json"), "w") as f:
             f.write(rules)
+        downloaded.append("rules/error_rules.json")
     return "main.py" in downloaded, downloaded
 
 
 def fix_paths(tmp_dir):
-    """Fix hardcoded ~/airflow_cmd_agent paths in fixer.py to use tmp_dir."""
+    """Fix hardcoded ~/airflow_cmd_agent paths in fixer.py."""
     fixer_path = os.path.join(tmp_dir, "fixer.py")
     if os.path.exists(fixer_path):
         with open(fixer_path, "r") as f:
@@ -119,24 +131,45 @@ def run_agent_script(tmp_dir, stdin_input=None, timeout=1200):
             output = f"Agent exited with code {result.returncode}\n{output}"
         return output.strip() or "Agent completed with no output."
     except subprocess.TimeoutExpired:
-        return "Agent timed out."
+        return "Agent timed out after the allowed time."
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error running agent: {e}"
 
 
 def run_agent(tool_name, args):
+
     if tool_name == "run_airflow_agent":
         port     = args.get("port", "8080")
         username = args.get("username", "admin")
         password = args.get("password", "admin")
-        tmp_dir  = tempfile.mkdtemp(prefix="airflow_agent_")
+        action   = args.get("action", "reinstall").lower()
+
+        # Map action to the choice number in main.py's prompt:
+        # "Choose [1=verify, 2=repair, 3=reinstall]:"
+        action_map = {"verify": "1", "repair": "2", "reinstall": "3"}
+        choice = action_map.get(action, "3")  # default 3=reinstall
+
+        tmp_dir = tempfile.mkdtemp(prefix="airflow_agent_")
         ok, downloaded = fetch_folder("airflow_agent", tmp_dir)
+        log.info(f"Airflow agent downloaded: {downloaded}")
+
         if not ok:
-            return f"Could not download airflow_agent/main.py from GitHub.\nDownloaded: {downloaded}"
+            return (
+                f"Could not download airflow_agent/main.py from GitHub.\n"
+                f"Downloaded: {downloaded}"
+            )
+
         fix_paths(tmp_dir)
-        log.info(f"Running airflow agent, downloaded: {downloaded}")
-        # Pass automated answers to input() prompts: port, username, password
-        stdin_input = f"{port}\n{username}\n{password}\n"
+
+        # stdin answers ALL input() and getpass() calls in order:
+        # 1. "Enter Airflow port [8080]: "          → port
+        # 2. "Enter admin username: "               → username
+        # 3. "Enter admin password: " (getpass)     → password
+        # 4. "Choose [1=verify, 2=repair, 3=reinstall]: " → choice (only shown if already installed)
+        # We send extra lines so every possible prompt is answered
+        stdin_input = f"{port}\n{username}\n{password}\n{choice}\n{choice}\n"
+
+        log.info(f"Running airflow agent: action={action} choice={choice} port={port} user={username}")
         return run_agent_script(tmp_dir, stdin_input=stdin_input, timeout=1200)
 
     elif tool_name == "run_hadoop_agent":
@@ -146,7 +179,17 @@ def run_agent(tool_name, args):
             return f"Could not download hadoop_agent/main.py from GitHub.\nDownloaded: {downloaded}"
         env = os.environ.copy()
         env["AGENT_VERSION"] = args.get("version", "3.3.6")
-        return run_agent_script(tmp_dir, timeout=600)
+        env["PYTHONPATH"] = tmp_dir
+        try:
+            result = subprocess.run(
+                [sys.executable, os.path.join(tmp_dir, "main.py")],
+                capture_output=True, text=True, timeout=600, env=env, cwd=tmp_dir
+            )
+            out = result.stdout or ""
+            if result.stderr: out += f"\n[stderr]:\n{result.stderr}"
+            return out.strip() or "Done."
+        except Exception as e:
+            return f"Error: {e}"
 
     elif tool_name == "run_spark_agent":
         tmp_dir = tempfile.mkdtemp(prefix="spark_agent_")
@@ -155,7 +198,17 @@ def run_agent(tool_name, args):
             return f"Could not download spark_agent/main.py from GitHub.\nDownloaded: {downloaded}"
         env = os.environ.copy()
         env["AGENT_VERSION"] = args.get("version", "3.5.0")
-        return run_agent_script(tmp_dir, timeout=600)
+        env["PYTHONPATH"] = tmp_dir
+        try:
+            result = subprocess.run(
+                [sys.executable, os.path.join(tmp_dir, "main.py")],
+                capture_output=True, text=True, timeout=600, env=env, cwd=tmp_dir
+            )
+            out = result.stdout or ""
+            if result.stderr: out += f"\n[stderr]:\n{result.stderr}"
+            return out.strip() or "Done."
+        except Exception as e:
+            return f"Error: {e}"
 
     return f"Unknown tool: {tool_name}"
 
@@ -168,7 +221,7 @@ def handle(req):
         return {"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "ai-agents-github-mcp", "version": "2.0.0"}
+            "serverInfo": {"name": "ai-agents-github-mcp", "version": "3.0.0"}
         }}
 
     if method == "tools/list":
@@ -193,7 +246,7 @@ def handle(req):
 
 
 def main():
-    log.info("ai-agents-github-mcp v2.0 started")
+    log.info("ai-agents-github-mcp v3.0 started")
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:
@@ -213,4 +266,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
