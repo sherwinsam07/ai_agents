@@ -97,6 +97,8 @@ def install_on_master(tarball):
         run(f"sudo rm -rf {target}")
     run(f"sudo tar -xzf {tarball} -C {INSTALL_DIR}")
     run(f"sudo ln -sfn {target} /opt/hadoop")
+    run(f"sudo chown -R {os.getenv('USER', 'vboxuser')}:{os.getenv('USER', 'vboxuser')} {target}")
+    run(f"sudo chown -R {os.getenv('USER', 'vboxuser')}:{os.getenv('USER', 'vboxuser')} /opt/hadoop")
     print(f"Master install done: /opt/hadoop -> {target}")
 
 def install_on_worker(w, tarball):
@@ -158,34 +160,36 @@ def configure_hadoop():
     nn.mkdir(parents=True, exist_ok=True)
     dn.mkdir(parents=True, exist_ok=True)
     replication = max(1, min(len(WORKERS) + 1, 3))
-    with open(f"{conf}/core-site.xml", "w") as f:
-        f.write(f"""<?xml version="1.0"?>
+    user = os.getenv("USER", "vboxuser")
+    run(f"sudo chown -R {user}:{user} /opt/hadoop-{HADOOP_VERSION} /opt/hadoop")
+    core = f"""<?xml version=\"1.0\"?>
 <configuration>
   <property><name>fs.defaultFS</name><value>hdfs://{MASTER_IP}:9000</value></property>
   <property><name>hadoop.tmp.dir</name><value>/opt/hadoop/tmp</value></property>
-</configuration>""")
-    with open(f"{conf}/hdfs-site.xml", "w") as f:
-        f.write(f"""<?xml version="1.0"?>
+</configuration>"""
+    run(f"sudo bash -c \"echo \'{core}\' > {conf}/core-site.xml\"")
+    hdfs = f"""<?xml version=\"1.0\"?>
 <configuration>
   <property><name>dfs.replication</name><value>{replication}</value></property>
   <property><name>dfs.namenode.name.dir</name><value>file://{nn}</value></property>
   <property><name>dfs.datanode.data.dir</name><value>file://{dn}</value></property>
-</configuration>""")
-    with open(f"{conf}/mapred-site.xml", "w") as f:
-        f.write("""<?xml version="1.0"?>
+</configuration>"""
+    run(f"sudo bash -c \"echo \'{hdfs}\' > {conf}/hdfs-site.xml\"")
+    mapred = """<?xml version=\"1.0\"?>
 <configuration>
   <property><name>mapreduce.framework.name</name><value>yarn</value></property>
-</configuration>""")
-    with open(f"{conf}/yarn-site.xml", "w") as f:
-        f.write(f"""<?xml version="1.0"?>
+</configuration>"""
+    run(f"sudo bash -c \"echo \'{mapred}\' > {conf}/mapred-site.xml\"")
+    yarn = f"""<?xml version=\"1.0\"?>
 <configuration>
   <property><name>yarn.nodemanager.aux-services</name><value>mapreduce_shuffle</value></property>
   <property><name>yarn.resourcemanager.hostname</name><value>{MASTER_IP}</value></property>
-</configuration>""")
+</configuration>"""
+    run(f"sudo bash -c \"echo \'{yarn}\' > {conf}/yarn-site.xml\"")
     workers_str = "\n".join([w["ip"] for w in WORKERS]) if WORKERS else "localhost"
-    with open(f"{conf}/workers", "w") as f:
-        f.write(workers_str + "\n")
+    run(f"sudo bash -c \"echo \'{workers_str}\' > {conf}/workers\"")
     run("sudo mkdir -p /opt/hadoop/tmp && sudo chmod 777 /opt/hadoop/tmp")
+    run(f"sudo chown -R {user}:{user} /opt/hadoop-{HADOOP_VERSION} /opt/hadoop")
     print("Config files written.")
 
 def setup_ssh():
